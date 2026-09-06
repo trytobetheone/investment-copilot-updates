@@ -141,6 +141,39 @@ def _extract_json_object(text: str) -> str:
     return value
 
 
+def _natural_language_values(obj: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for value in obj.values():
+            out.extend(_natural_language_values(value))
+    elif isinstance(obj, list):
+        for value in obj:
+            out.extend(_natural_language_values(value))
+    elif isinstance(obj, str):
+        v = obj.strip()
+        if not v:
+            return out
+        # Ignore obvious codes, URLs, tickers, dates and enum-like tokens.
+        if v.startswith(("http://", "https://")):
+            return out
+        if len(v) <= 24 and all(ch.isupper() or ch.isdigit() or ch in "_-. /" for ch in v):
+            return out
+        out.append(v)
+    return out
+
+
+def _looks_sufficiently_korean(obj: Any) -> bool:
+    texts = _natural_language_values(obj)
+    if not texts:
+        return True
+    joined = " ".join(texts)
+    hangul = sum(1 for ch in joined if "가" <= ch <= "힣")
+    latin = sum(1 for ch in joined if ("a" <= ch.lower() <= "z"))
+    # Product names/tickers can be English, so require either a useful absolute amount
+    # of Korean or Korean to be a meaningful share of explanatory prose.
+    return hangul >= 24 or (hangul >= 10 and hangul / max(hangul + latin, 1) >= 0.18)
+
+
 async def run_local_structured(
     config: AIConfig,
     *,
@@ -175,7 +208,9 @@ async def run_local_structured(
     base_user = (
         "/no_think\n"
         "Return exactly one JSON object matching the required schema. "
-        "Do not call tools, do not wrap it in markdown, and do not add commentary.\n\n"
+        "Do not call tools, do not wrap it in markdown, and do not add commentary.\n"
+        "IMPORTANT LANGUAGE RULE: every explanatory natural-language string value MUST be Korean. "
+        "English is allowed only for ticker symbols, official product/company names, URLs, and required enum/code values.\n\n"
         + prompt
     )
     last_error: Exception | None = None
@@ -195,12 +230,16 @@ async def run_local_structured(
             )
             content = response.choices[0].message.content or ""
             candidate = _extract_json_object(content)
-            return output_type.model_validate_json(candidate)
+            parsed = output_type.model_validate_json(candidate)
+            if not _looks_sufficiently_korean(parsed.model_dump()):
+                raise ValueError("설명형 문자열이 한국어 출력 규칙을 충족하지 못했습니다.")
+            return parsed
         except (ValidationError, json.JSONDecodeError, ValueError, TypeError) as exc:
             last_error = exc
             retry_note = (
                 "\n\nYour previous response failed schema validation. "
-                "Retry once. Output ONLY the valid JSON object; keep arrays concise."
+                "Retry once. Output ONLY the valid JSON object; keep arrays concise. "
+                "All explanatory string values MUST be Korean; use English only for tickers, official names and enum/code values."
             )
         except Exception as exc:
             last_error = exc
