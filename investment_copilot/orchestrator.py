@@ -11,7 +11,7 @@ from agents import Runner
 from .agents import bear_agent, cio_agent, compliance_agent, factcheck_agent, macro_agent, product_agent, suitability_agent
 from .ai_backend import load_ai_config, needs_openai_api, resolve_local_model, run_local_structured
 from .config import settings
-from .local_research import build_market_snapshot, build_product_catalog
+from .local_research import build_market_snapshot, build_product_catalog, build_stock_snapshot
 from .quant import analyze_candidates, construct_candidates
 from .schema import AnalysisRecord, ClientProfile
 from .secrets import get_openai_api_key
@@ -56,7 +56,9 @@ def _configure_openai_if_needed(mode: str) -> None:
 
 async def _run_local_round1(profile: ClientProfile, profile_json: str, ai_cfg: Any, cb: ProgressCallback):
     _emit(cb, "local-data", "Yahoo Finance 벤치마크로 로컬 시장 스냅샷을 만드는 중")
-    snapshot = await asyncio.to_thread(build_market_snapshot, 2)
+    snapshot_task = asyncio.to_thread(build_market_snapshot, 2)
+    stock_task = asyncio.to_thread(build_stock_snapshot, profile, 2)
+    snapshot, stock_snapshot = await asyncio.gather(snapshot_task, stock_task)
     catalog = build_product_catalog(profile)
 
     _emit(cb, "round1-local", "LOCAL Macro Agent 실행 중 (외부 AI API 사용 없음)")
@@ -80,13 +82,24 @@ CLIENT PROFILE
 LOCAL PRODUCT CATALOG
 {_json(catalog)}
 
-Select 4-8 products ONLY from the catalog. Do not invent products, fees, tax facts, or URLs.
+LOCAL STOCK SCREEN
+{_json(stock_snapshot)}
+
+Client product_style is {profile.product_style}. Select 4-8 products ONLY from the catalog.
+If product_style is MIXED or STOCK_ACTIVE, include individual stocks when justified by the supplied price screen and diversification needs;
+do not infer fundamentals, valuation or catalysts that are not supplied. Do not invent products, fees, tax facts, or URLs.
 """
     product = await _run_local_agent(ai_cfg, product_agent(web_enabled=False), product_prompt)
 
     _emit(cb, "round1-local", "LOCAL Suitability Agent 실행 중")
     suitability = await _run_local_agent(ai_cfg, suitability_agent(), f"Review this client profile exactly as supplied:\n{profile_json}")
-    return macro, product, suitability, snapshot, catalog
+    # Deterministic sanity rule: an unspecified target return alone is not grounds for FAIL.
+    if suitability.status == "FAIL":
+        missing = {str(x).strip().lower() for x in suitability.missing_information}
+        if missing and missing.issubset({"target_return_pct", "target return", "목표수익률", "목표 연수익률"}):
+            suitability.status = "REVIEW"
+            suitability.suitability_notes.insert(0, "시스템 보정: 목표수익률 미지정만으로는 부적합(FAIL) 처리하지 않습니다.")
+    return macro, product, suitability, snapshot, catalog, stock_snapshot
 
 
 async def _run_cloud_round1(profile_json: str, cb: ProgressCallback):
@@ -120,9 +133,10 @@ async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisR
     profile_json = profile.model_dump_json(indent=2)
     local_snapshot: dict[str, Any] | None = None
     local_catalog: list[dict[str, Any]] | None = None
+    local_stock_snapshot: dict[str, Any] | None = None
 
     if mode == "LOCAL":
-        macro, product, suitability, local_snapshot, local_catalog = await _run_local_round1(profile, profile_json, ai_cfg, cb)
+        macro, product, suitability, local_snapshot, local_catalog, local_stock_snapshot = await _run_local_round1(profile, profile_json, ai_cfg, cb)
     elif mode == "HYBRID":
         macro, product, suitability = await _run_hybrid_round1(profile_json, ai_cfg, cb)
     else:
@@ -163,13 +177,24 @@ LOCAL QUANT RESULTS (authoritative for historical numerical metrics; base curren
 {_json(quant_results)}
 """
     if mode == "LOCAL":
+        selected_tickers = {p.ticker for p in product.products}
+        catalog_review = [x for x in (local_catalog or []) if str(x.get("ticker")) in selected_tickers]
+        stock_rows = [x for x in ((local_stock_snapshot or {}).get("stocks") or []) if str(x.get("ticker")) in selected_tickers]
+        stock_review = {
+            "method": (local_stock_snapshot or {}).get("method", ""),
+            "stocks": stock_rows,
+            "warnings": (local_stock_snapshot or {}).get("warnings", []),
+        }
         review_packet += f"""
 
 LOCAL MARKET SNAPSHOT
 {_json(local_snapshot)}
 
-LOCAL PRODUCT CATALOG
-{_json(local_catalog)}
+SELECTED LOCAL PRODUCT CATALOG ITEMS
+{_json(catalog_review)}
+
+SELECTED LOCAL STOCK SCREEN ITEMS
+{_json(stock_review)}
 """
 
     if mode == "LOCAL":
@@ -195,6 +220,11 @@ LOCAL PRODUCT CATALOG
     if mode == "CLOUD":
         bear, factcheck, compliance = bear_result.final_output, fact_result.final_output, compliance_result.final_output
 
+    # A FAIL must mean an actual hard problem, not merely a list of items to confirm.
+    if compliance.status == "FAIL" and not compliance.issues:
+        compliance.status = "REVIEW"
+        compliance.required_human_checks.insert(0, "시스템 보정: 확인 필요 항목만 있고 명시적 위반 이슈가 없어 REVIEW로 조정했습니다.")
+
     _emit(cb, "cio", f"CIO 최종판정 실행 중 ({'LOCAL' if mode in {'LOCAL','HYBRID'} else 'OpenAI'})")
     final_packet = review_packet + f"""
 
@@ -219,20 +249,20 @@ IMPORTANT: select only C1/C2/C3 or HUMAN_REVIEW_REQUIRED. Do not change any allo
     if final.decision == "SELECT" and final.selected_candidate_id not in valid_ids:
         final.decision = "HUMAN_REVIEW_REQUIRED"
         final.selected_candidate_id = None
-        final.rationale.insert(0, "System guardrail: CIO returned an invalid candidate ID.")
+        final.rationale.insert(0, "시스템 안전장치: CIO가 유효하지 않은 후보 ID를 반환해 사람 검토로 전환했습니다.")
         final.confidence_pct = min(final.confidence_pct, 25)
 
     if compliance.status == "FAIL" or suitability.status == "FAIL" or factcheck.overall_status == "FAIL":
         final.decision = "HUMAN_REVIEW_REQUIRED"
         final.selected_candidate_id = None
-        final.rationale.insert(0, "System guardrail: a mandatory review gate failed.")
+        final.rationale.insert(0, "시스템 안전장치: 필수 검토 단계에서 FAIL이 발생해 사람 검토가 필요합니다.")
         final.confidence_pct = min(final.confidence_pct, 40)
 
     selected_quant = next((q.metrics for q in quant_results if q.candidate_id == final.selected_candidate_id), None)
     if selected_quant and selected_quant.status == "FAILED":
         final.decision = "HUMAN_REVIEW_REQUIRED"
         final.selected_candidate_id = None
-        final.rationale.insert(0, "System guardrail: selected candidate has failed quantitative validation.")
+        final.rationale.insert(0, "시스템 안전장치: 선택 후보의 정량 검증이 실패해 사람 검토가 필요합니다.")
         final.confidence_pct = min(final.confidence_pct, 30)
 
     return AnalysisRecord(
