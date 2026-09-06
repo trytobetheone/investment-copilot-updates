@@ -10,6 +10,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .config import BASE_DIR, DATA_DIR
 
@@ -47,19 +48,58 @@ def _version_tuple(value: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def normalize_manifest_url(value: str) -> str:
+    """Accept either a manifest URL or a normal GitHub repository URL."""
+    url = (value or "").strip()
+    if not url:
+        return ""
+
+    if url.startswith("https://raw.githubusercontent.com/"):
+        return url
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.strip("/")
+        if host in {"github.com", "www.github.com"}:
+            parts = path.split("/")
+            if len(parts) >= 2:
+                owner = parts[0]
+                repo = parts[1]
+                if repo.endswith(".git"):
+                    repo = repo[:-4]
+
+                # github.com/owner/repo/blob/branch/update_manifest.json
+                if len(parts) >= 5 and parts[2] == "blob":
+                    branch = parts[3]
+                    file_path = "/".join(parts[4:])
+                    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+
+                # github.com/owner/repo(.git)
+                if len(parts) == 2:
+                    return f"https://raw.githubusercontent.com/{owner}/{repo}/main/update_manifest.json"
+    except Exception:
+        pass
+
+    return url
+
+
 def load_update_config() -> dict:
     if not CONFIG_PATH.exists():
         return {"manifest_url": DEFAULT_MANIFEST_URL}
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data["manifest_url"] = normalize_manifest_url(str(data.get("manifest_url") or ""))
+        return data
     except Exception:
         return {"manifest_url": DEFAULT_MANIFEST_URL}
 
 
 def save_update_config(manifest_url: str) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    normalized = normalize_manifest_url(manifest_url)
     CONFIG_PATH.write_text(
-        json.dumps({"manifest_url": manifest_url.strip()}, ensure_ascii=False, indent=2),
+        json.dumps({"manifest_url": normalized}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -67,13 +107,14 @@ def save_update_config(manifest_url: str) -> None:
 def check_for_update(timeout: int = 12) -> UpdateInfo:
     cur = current_version()
     config = load_update_config()
-    url = str(config.get("manifest_url") or "").strip()
+    url = normalize_manifest_url(str(config.get("manifest_url") or ""))
     if not url:
         return UpdateInfo(current_version=cur, error="업데이트 채널이 아직 연결되지 않았습니다.")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "InvestmentCommitteeCopilot-Updater/1"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8-sig"))
+            raw = resp.read().decode("utf-8-sig")
+            payload = json.loads(raw)
         latest = str(payload["version"]).strip()
         download_url = str(payload["download_url"]).strip()
         sha256 = str(payload.get("sha256") or "").strip().lower() or None
@@ -87,6 +128,11 @@ def check_for_update(timeout: int = 12) -> UpdateInfo:
             sha256=sha256,
             notes=[str(x) for x in notes],
             available=_version_tuple(latest) > _version_tuple(cur),
+        )
+    except json.JSONDecodeError:
+        return UpdateInfo(
+            current_version=cur,
+            error="업데이트 채널이 JSON manifest가 아닙니다. GitHub 저장소 주소 또는 update_manifest.json 주소를 입력하세요.",
         )
     except Exception as exc:
         return UpdateInfo(current_version=cur, error=f"업데이트 확인 실패: {exc}")
