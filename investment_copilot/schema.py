@@ -36,6 +36,7 @@ class ClientProfile(BaseModel):
     target_return_pct: float | None = Field(default=None, ge=-100, le=100)
     experience_level: Literal["low", "medium", "high"] = "medium"
     tax_priority: Literal["low", "medium", "high"] = "medium"
+    product_style: Literal["ETF_ONLY", "MIXED", "STOCK_ACTIVE"] = "MIXED"
     restrictions: str = ""
     preferences: str = ""
     notes: str = ""
@@ -64,6 +65,8 @@ class AssetTilt(BaseModel):
 class MacroReport(BaseModel):
     regime_summary: str
     scenarios: list[MacroScenario] = Field(default_factory=list)
+    # Keep this as an explicit list instead of dict[str, ...]. OpenAI strict structured
+    # outputs reject free-form/typed additionalProperties objects.
     asset_tilts: list[AssetTilt] = Field(default_factory=list)
     key_risks: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
