@@ -1,0 +1,9 @@
+openai-agents==0.22.0
+streamlit==1.63.0
+pydantic>=2.13.0,<3
+pandas>=2.2.0,<3
+numpy>=1.26.0,<3
+yfinance==1.7.0
+python-dotenv>=1.0.1,<2
+keyring>=25.0.0,<26
+pytest>=8.0.0,<9
