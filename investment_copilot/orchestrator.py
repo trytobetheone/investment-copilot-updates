@@ -9,7 +9,9 @@ from typing import Any, Callable
 from agents import Runner
 
 from .agents import bear_agent, cio_agent, compliance_agent, factcheck_agent, macro_agent, product_agent, suitability_agent
+from .ai_backend import build_local_model, load_ai_config, needs_openai_api
 from .config import settings
+from .local_research import build_market_snapshot, build_product_catalog
 from .quant import analyze_candidates, construct_candidates
 from .schema import AnalysisRecord, ClientProfile
 from .secrets import get_openai_api_key
@@ -28,23 +30,95 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
 
 
-async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisRecord:
+def _configure_openai_if_needed(mode: str) -> None:
+    if not needs_openai_api(mode):
+        return
     api_key = get_openai_api_key()
     if not api_key:
-        raise RuntimeError("OpenAI API key not configured. Open Settings in the app and save a key first.")
+        raise RuntimeError(
+            "이 AI 모드는 OpenAI API key가 필요합니다. 설정에서 API key를 저장하거나 LOCAL 모드로 변경하세요."
+        )
     os.environ["OPENAI_API_KEY"] = api_key
-    profile_json = profile.model_dump_json(indent=2)
 
-    _emit(cb, "round1", "거시·상품·고객적합성 에이전트를 서로 독립적으로 실행 중")
+
+async def _run_local_round1(profile: ClientProfile, profile_json: str, local_model: Any, cb: ProgressCallback):
+    _emit(cb, "local-data", "Yahoo Finance 벤치마크로 로컬 시장 스냅샷을 만드는 중")
+    snapshot = await asyncio.to_thread(build_market_snapshot, 2)
+    catalog = build_product_catalog(profile)
+
+    _emit(cb, "round1-local", "LOCAL Macro Agent 실행 중 (외부 AI API 사용 없음)")
+    macro_prompt = f"""
+Today's UTC date is {datetime.now(timezone.utc).date()}.
+CLIENT PROFILE
+{profile_json}
+
+LOCAL MARKET SNAPSHOT
+{_json(snapshot)}
+
+Important: You have no web access. Use only this snapshot for current market observations.
+"""
+    macro_result = await Runner.run(macro_agent(local_model, web_enabled=False), macro_prompt)
+    macro = macro_result.final_output
+
+    _emit(cb, "round1-local", "LOCAL Product Agent 실행 중 (고정 검증 카탈로그에서만 선택)")
+    product_prompt = f"""
+CLIENT PROFILE
+{profile_json}
+
+LOCAL PRODUCT CATALOG
+{_json(catalog)}
+
+Select 4-8 products ONLY from the catalog. Do not invent products, fees, tax facts, or URLs.
+"""
+    product_result = await Runner.run(product_agent(local_model, web_enabled=False), product_prompt)
+    product = product_result.final_output
+
+    _emit(cb, "round1-local", "LOCAL Suitability Agent 실행 중")
+    suitability_result = await Runner.run(suitability_agent(local_model), f"Review this client profile exactly as supplied:\n{profile_json}")
+    suitability = suitability_result.final_output
+    return macro, product, suitability, snapshot, catalog
+
+
+async def _run_cloud_round1(profile_json: str, cb: ProgressCallback):
+    _emit(cb, "round1-cloud", "거시·상품·고객적합성 에이전트를 OpenAI로 독립 실행 중")
     macro_task = Runner.run(macro_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
     product_task = Runner.run(product_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
     suitability_task = Runner.run(suitability_agent(), f"Review this client profile exactly as supplied:\n{profile_json}")
     macro_result, product_result, suitability_result = await asyncio.gather(macro_task, product_task, suitability_task)
-    macro = macro_result.final_output
-    product = product_result.final_output
-    suitability = suitability_result.final_output
+    return macro_result.final_output, product_result.final_output, suitability_result.final_output
 
-    _emit(cb, "construction", "AI가 정한 상품군을 사용해 로컬 엔진이 C1/C2/C3 비중을 계산 중")
+
+async def _run_hybrid_round1(profile_json: str, local_model: Any, cb: ProgressCallback):
+    _emit(cb, "round1-hybrid", "Macro/Product는 웹 리서치, Suitability는 LOCAL 모델로 실행 중")
+    macro_task = Runner.run(macro_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
+    product_task = Runner.run(product_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
+    macro_result, product_result = await asyncio.gather(macro_task, product_task)
+    suitability_result = await Runner.run(suitability_agent(local_model), f"Review this client profile exactly as supplied:\n{profile_json}")
+    return macro_result.final_output, product_result.final_output, suitability_result.final_output
+
+
+async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisRecord:
+    ai_cfg = load_ai_config()
+    mode = ai_cfg.mode.upper()
+    _configure_openai_if_needed(mode)
+
+    local_model = None
+    if mode in {"LOCAL", "HYBRID"}:
+        _emit(cb, "local-ai", "LM Studio 로컬 모델 연결 확인 중")
+        local_model = build_local_model(ai_cfg)
+
+    profile_json = profile.model_dump_json(indent=2)
+    local_snapshot: dict[str, Any] | None = None
+    local_catalog: list[dict[str, Any]] | None = None
+
+    if mode == "LOCAL":
+        macro, product, suitability, local_snapshot, local_catalog = await _run_local_round1(profile, profile_json, local_model, cb)
+    elif mode == "HYBRID":
+        macro, product, suitability = await _run_hybrid_round1(profile_json, local_model, cb)
+    else:
+        macro, product, suitability = await _run_cloud_round1(profile_json, cb)
+
+    _emit(cb, "construction", "상품군을 사용해 로컬 Python 엔진이 C1/C2/C3 비중을 계산 중")
     candidates = await asyncio.to_thread(construct_candidates, profile, product, macro, settings.price_history_years)
 
     _emit(cb, "quant", "후보별 기준통화 환산 가격으로 수익·변동성·MDD·VaR/CVaR 계산 중")
@@ -57,6 +131,9 @@ async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisR
     )
 
     review_packet = f"""
+AI MODE
+{mode}
+
 CLIENT PROFILE
 {profile_json}
 
@@ -75,15 +152,38 @@ DETERMINISTIC CANDIDATES (weights were set by local Python, not by an LLM)
 LOCAL QUANT RESULTS (authoritative for historical numerical metrics; base currency={profile.base_currency})
 {_json(quant_results)}
 """
+    if mode == "LOCAL":
+        review_packet += f"""
 
-    _emit(cb, "review", "Bear·Fact Check·Compliance 세 팀이 후보를 교차검증 중")
-    bear_task = Runner.run(bear_agent(), review_packet)
-    fact_task = Runner.run(factcheck_agent(), review_packet)
-    compliance_task = Runner.run(compliance_agent(), review_packet)
-    bear_result, fact_result, compliance_result = await asyncio.gather(bear_task, fact_task, compliance_task)
+LOCAL MARKET SNAPSHOT
+{_json(local_snapshot)}
+
+LOCAL PRODUCT CATALOG
+{_json(local_catalog)}
+"""
+
+    if mode == "LOCAL":
+        _emit(cb, "review-local", "LOCAL Bear Agent 실행 중")
+        bear_result = await Runner.run(bear_agent(local_model, local_mode=True), review_packet)
+        _emit(cb, "review-local", "LOCAL Fact Checker 실행 중 (웹 검증 아님)")
+        fact_result = await Runner.run(factcheck_agent(local_model, web_enabled=False), review_packet)
+        _emit(cb, "review-local", "LOCAL Compliance Agent 실행 중")
+        compliance_result = await Runner.run(compliance_agent(local_model, local_mode=True), review_packet)
+    elif mode == "HYBRID":
+        _emit(cb, "review-hybrid", "Bear/Compliance는 LOCAL, Fact Check만 웹 리서치로 실행 중")
+        bear_result = await Runner.run(bear_agent(local_model, local_mode=True), review_packet)
+        fact_result = await Runner.run(factcheck_agent(), review_packet)
+        compliance_result = await Runner.run(compliance_agent(local_model, local_mode=True), review_packet)
+    else:
+        _emit(cb, "review-cloud", "Bear·Fact Check·Compliance 세 팀을 OpenAI로 교차검증 중")
+        bear_task = Runner.run(bear_agent(), review_packet)
+        fact_task = Runner.run(factcheck_agent(), review_packet)
+        compliance_task = Runner.run(compliance_agent(), review_packet)
+        bear_result, fact_result, compliance_result = await asyncio.gather(bear_task, fact_task, compliance_task)
+
     bear, factcheck, compliance = bear_result.final_output, fact_result.final_output, compliance_result.final_output
 
-    _emit(cb, "cio", "CIO가 검증 완료 후보 중 하나를 선택하거나 사람 검토로 보류 중")
+    _emit(cb, "cio", f"CIO 최종판정 실행 중 ({'LOCAL' if mode in {'LOCAL','HYBRID'} else 'OpenAI'})")
     final_packet = review_packet + f"""
 
 BEAR REVIEW
@@ -97,7 +197,10 @@ COMPLIANCE REVIEW
 
 IMPORTANT: select only C1/C2/C3 or HUMAN_REVIEW_REQUIRED. Do not change any allocation.
 """
-    final_result = await Runner.run(cio_agent(), final_packet)
+    if mode in {"LOCAL", "HYBRID"}:
+        final_result = await Runner.run(cio_agent(local_model, local_mode=True), final_packet)
+    else:
+        final_result = await Runner.run(cio_agent(), final_packet)
     final = final_result.final_output
 
     valid_ids = {c.candidate_id for c in candidates.candidates}
