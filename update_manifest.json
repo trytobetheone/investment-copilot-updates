@@ -1,14 +1,11 @@
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "download_url": "https://github.com/trytobetheone/investment-copilot-updates/archive/refs/heads/main.zip",
   "sha256": "",
   "notes": [
-    "LOCAL/HYBRID/CLOUD AI 엔진 선택 기능을 추가했습니다.",
-    "LOCAL 모드는 LM Studio의 로컬 모델을 사용해 OpenAI API 크레딧을 전혀 사용하지 않습니다.",
-    "16GB 노트북용 Qwen3 8B Q4_K_M 설치/준비 도우미를 추가했습니다.",
-    "LOCAL 모드에서는 에이전트를 순차 실행해 메모리 사용량을 줄입니다.",
-    "로컬 Macro는 Yahoo Finance 시장 스냅샷, Product는 제한된 로컬 상품 카탈로그를 사용합니다.",
-    "HYBRID는 Macro/Product/Fact Check만 OpenAI를 사용해 API 비용을 줄입니다.",
-    "OpenAI 크레딧 부족 및 LM Studio 연결 오류를 사용자 친화적으로 표시합니다."
+    "LOCAL/HYBRID에서 Qwen3가 MaxTurnsExceeded에 빠질 수 있는 문제를 수정했습니다.",
+    "로컬 에이전트는 이제 Agents SDK의 다중-turn 루프 대신 LM Studio JSON Schema one-shot 호출을 사용합니다.",
+    "Qwen3에는 /no_think와 구조화 JSON 출력을 강제해 16GB 노트북에서 더 빠르고 안정적으로 동작합니다.",
+    "CLOUD 모드는 기존 OpenAI Agents SDK 흐름을 그대로 유지합니다."
   ]
 }
