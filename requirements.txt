@@ -7,3 +7,5 @@ yfinance==1.7.0
 python-dotenv>=1.0.1,<2
 keyring>=25.0.0,<26
 pytest>=8.0.0,<9
+psutil>=7.0.0,<8
+openai>=3.0.0,<4
