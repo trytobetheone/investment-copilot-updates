@@ -54,6 +54,33 @@ def _cap_and_redistribute(weights: dict[str, float], cap: float = 0.35) -> dict[
     return {k: v / total for k, v in w.items()} if total > 0 else w
 
 
+def _cap_and_redistribute_variable(weights: dict[str, float], caps: dict[str, float]) -> dict[str, float]:
+    w = dict(weights)
+    if not w:
+        return w
+    for _ in range(50):
+        over = {k: v for k, v in w.items() if v > caps.get(k, 0.35) + 1e-12}
+        if not over:
+            break
+        excess = 0.0
+        for k, v in over.items():
+            cap = caps.get(k, 0.35)
+            excess += v - cap
+            w[k] = cap
+        under = [k for k in w if w[k] < caps.get(k, 0.35) - 1e-12]
+        room = sum(caps.get(k, 0.35) - w[k] for k in under)
+        if not under or room <= 1e-12:
+            break
+        for k in under:
+            w[k] += excess * (caps.get(k, 0.35) - w[k]) / room
+    total = sum(w.values())
+    # If the sum of per-line caps is below 100%, keep the unallocated remainder
+    # as implicit cash instead of renormalizing and breaking the caps.
+    if total <= 1.0 + 1e-12:
+        return w
+    return {k: v / total for k, v in w.items()} if total > 0 else w
+
+
 def construct_candidates(
     profile: ClientProfile,
     product: ProductUniverse,
@@ -72,6 +99,7 @@ def construct_candidates(
     vols = returns.std(ddof=1) * math.sqrt(TRADING_DAYS)
 
     tilt_mult = {"UNDERWEIGHT": 0.85, "NEUTRAL": 1.0, "OVERWEIGHT": 1.15}
+    # MacroReport.asset_tilts is a strict-schema-compatible list of AssetTilt objects.
     macro_tilts = {item.asset_class: item.view for item in macro.asset_tilts}
     posture_mult = {
         "defensive": {
@@ -89,9 +117,9 @@ def construct_candidates(
 
     base_target_vol = float(np.clip(profile.max_tolerable_loss_pct / 2.0, 4.0, 18.0)) / 100.0
     specs = [
-        ("C1", "Defensive", "defensive", 0.75),
-        ("C2", "Balanced", "balanced", 1.00),
-        ("C3", "Growth-tilted", "growth", 1.25),
+        ("C1", "방어형", "defensive", 0.75),
+        ("C2", "균형형", "balanced", 1.00),
+        ("C3", "성장형", "growth", 1.25),
     ]
     candidates: list[CandidatePortfolio] = []
 
@@ -107,7 +135,12 @@ def construct_candidates(
             continue
         total_raw = sum(raw.values())
         risky_weights = {k: v / total_raw for k, v in raw.items()}
-        risky_weights = _cap_and_redistribute(risky_weights, cap=0.35)
+        pmap_pre = {p.ticker: p for p in usable}
+        line_caps = {
+            t: (0.10 if "[STOCK]" in (pmap_pre[t].role or "").upper() else 0.35)
+            for t in risky_weights
+        }
+        risky_weights = _cap_and_redistribute_variable(risky_weights, line_caps)
 
         tickers = list(risky_weights)
         w_vec = np.array([risky_weights[t] for t in tickers])
@@ -139,28 +172,29 @@ def construct_candidates(
         allocations.append(
             AllocationLine(
                 ticker="CASH",
-                name=f"Cash / cash-equivalent ({profile.base_currency})",
+                name=f"현금 / 현금성 자산 ({profile.base_currency})",
                 asset_class="CASH",
                 currency=profile.base_currency,
                 weight=round(cash_weight * 100.0, 4),
-                role="liquidity and volatility buffer",
+                role="유동성 및 변동성 완충",
             )
         )
         residue = round(100.0 - sum(a.weight for a in allocations), 4)
         allocations[-1].weight = round(allocations[-1].weight + residue, 4)
         note = (
-            f"Local engine: inverse-vol diversification, 35% single-line cap, base-currency ({profile.base_currency}) risk targeting; "
-            f"target historical vol ≈ {target_vol*100:.1f}%; this does NOT guarantee the client max-loss limit."
+            f"로컬 엔진: 역변동성 분산, ETF 최대 35%·개별주 최대 10% 단일종목 한도, "
+            f"기준통화({profile.base_currency}) 위험 타기팅. 목표 과거 변동성 약 {target_vol*100:.1f}%. "
+            "이 수치는 고객의 최대손실 한도를 보장하지 않습니다."
         )
         if warnings:
-            note += " Data warnings: " + " / ".join(warnings)
+            note += " 데이터 경고: " + " / ".join(warnings)
         candidates.append(
             CandidatePortfolio(
                 candidate_id=cid,
                 label=label,
-                thesis=f"{label} posture generated deterministically from client loss tolerance, minimum liquidity, product universe, and bounded macro tilts.",
+                thesis=f"고객의 손실감내도·최소 유동성·상품군·제한된 매크로 틸트를 반영해 Python이 결정론적으로 생성한 {label} 후보입니다.",
                 allocations=allocations,
-                implementation_notes=[note, f"Construction data: {aligned.index.min().date()} to {aligned.index.max().date()}."],
+                implementation_notes=[note, f"구성 데이터 기간: {aligned.index.min().date()} ~ {aligned.index.max().date()}."],
             )
         )
 
@@ -178,23 +212,23 @@ def analyze_candidate(
     total = candidate.total_weight()
     warnings: list[str] = []
     if not math.isclose(total, 100.0, abs_tol=0.25):
-        warnings.append(f"Weights sum to {total:.2f}%, not 100%.")
+        warnings.append(f"비중 합계가 {total:.2f}%로 100%가 아닙니다.")
 
     non_cash = [a for a in candidate.allocations if a.ticker.upper() != "CASH"]
     instruments = {a.ticker: a.currency for a in non_cash}
     prices, price_warnings = fetch_prices_in_base(instruments, base_currency, years=years)
     warnings.extend(price_warnings)
     if prices.empty:
-        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", warnings=warnings or ["No price data."]))
+        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", warnings=warnings or ["가격 데이터가 없습니다."]))
 
     usable = [a for a in non_cash if a.ticker in prices.columns and not prices[a.ticker].dropna().empty]
     if not usable:
-        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", warnings=warnings + ["No usable ticker history."]))
+        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", warnings=warnings + ["사용 가능한 티커 가격 이력이 없습니다."]))
 
     use_tickers = [a.ticker for a in usable]
     aligned = prices[use_tickers].ffill().dropna()
     if len(aligned) < 60:
-        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", observations=len(aligned), warnings=warnings + ["Less than 60 aligned price observations."]))
+        return CandidateQuantResult(candidate_id=candidate.candidate_id, metrics=QuantMetrics(status="FAILED", observations=len(aligned), warnings=warnings + ["정렬된 가격 관측치가 60개 미만입니다."]))
 
     returns = aligned.pct_change().dropna()
     weights = np.array([a.weight / 100.0 for a in usable], dtype=float)
@@ -202,7 +236,7 @@ def analyze_candidate(
     represented_weight = float(weights.sum() + cash_weight)
     missing_weight = max(0.0, 1.0 - represented_weight)
     if missing_weight > 0.005:
-        warnings.append(f"{missing_weight*100:.2f}% of portfolio is omitted due to unavailable price/FX data.")
+        warnings.append(f"가격/환율 데이터 부족으로 포트폴리오의 {missing_weight*100:.2f}%가 정량 계산에서 제외되었습니다.")
 
     cash_daily = (1 + risk_free_rate_pct / 100.0) ** (1 / TRADING_DAYS) - 1
     port = returns.mul(weights, axis=1).sum(axis=1) + cash_weight * cash_daily
