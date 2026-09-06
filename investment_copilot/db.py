@@ -40,6 +40,20 @@ class Database:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    analysis_id INTEGER NOT NULL UNIQUE,
+                    client_code TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source_candidate_id TEXT,
+                    executed_at TEXT NOT NULL,
+                    portfolio_json TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
             conn.commit()
 
     def upsert_client(self, profile: ClientProfile) -> None:
@@ -115,3 +129,80 @@ class Database:
         if not row:
             return None
         return AnalysisRecord.model_validate_json(row["record_json"])
+
+    def save_execution(
+        self,
+        analysis_id: int,
+        client_code: str,
+        status: str,
+        source_candidate_id: str | None,
+        portfolio: list[dict],
+        note: str = "",
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO executions(analysis_id, client_code, status, source_candidate_id, executed_at, portfolio_json, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(analysis_id) DO UPDATE SET
+                    client_code=excluded.client_code,
+                    status=excluded.status,
+                    source_candidate_id=excluded.source_candidate_id,
+                    executed_at=excluded.executed_at,
+                    portfolio_json=excluded.portfolio_json,
+                    note=excluded.note
+                """,
+                (analysis_id, client_code, status, source_candidate_id, now, json.dumps(portfolio, ensure_ascii=False), note),
+            )
+            row = conn.execute("SELECT id FROM executions WHERE analysis_id = ?", (analysis_id,)).fetchone()
+            conn.commit()
+            return int(row["id"])
+
+    def get_execution_for_analysis(self, analysis_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM executions WHERE analysis_id = ?", (analysis_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "analysis_id": row["analysis_id"],
+            "client_code": row["client_code"],
+            "status": row["status"],
+            "source_candidate_id": row["source_candidate_id"],
+            "executed_at": row["executed_at"],
+            "portfolio": json.loads(row["portfolio_json"] or "[]"),
+            "note": row["note"],
+        }
+
+    def get_latest_execution(self, client_code: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM executions WHERE client_code = ? AND status IN ('EXECUTED_AS_RECOMMENDED','EXECUTED_MODIFIED') ORDER BY executed_at DESC, id DESC LIMIT 1",
+                (client_code,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "analysis_id": row["analysis_id"],
+            "client_code": row["client_code"],
+            "status": row["status"],
+            "source_candidate_id": row["source_candidate_id"],
+            "executed_at": row["executed_at"],
+            "portfolio": json.loads(row["portfolio_json"] or "[]"),
+            "note": row["note"],
+        }
+
+    def execution_status_map(self, analysis_ids: list[int]) -> dict[int, str]:
+        if not analysis_ids:
+            return {}
+        marks = ",".join("?" for _ in analysis_ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT analysis_id, status FROM executions WHERE analysis_id IN ({marks})",
+                analysis_ids,
+            ).fetchall()
+        return {int(r["analysis_id"]): str(r["status"]) for r in rows]
