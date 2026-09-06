@@ -1,9 +1,11 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.2",
   "download_url": "https://github.com/trytobetheone/investment-copilot-updates/archive/refs/heads/main.zip",
   "sha256": "",
   "notes": [
-    "자동 업데이트 채널이 연결되었습니다.",
-    "현재 설치된 v0.2.0이 최신 안정 버전입니다."
+    "Strict JSON Schema 오류를 수정했습니다.",
+    "Macro Agent의 asset_tilts를 strict-compatible 구조로 변경했습니다.",
+    "앱 시작 전에 모든 에이전트 출력 스키마를 검사하는 preflight self-check를 추가했습니다.",
+    "고객 DB, 분석 기록, OpenAI API key는 업데이트 시 그대로 보존됩니다."
   ]
 }
