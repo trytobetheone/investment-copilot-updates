@@ -11,14 +11,24 @@ echo Recommended for this PC: Qwen3 8B, GGUF Q4_K_M, context 8192.
 echo Approximate model download: several GB. Close games such as NIKKE first.
 echo.
 
+set "LMS="
 where lms >nul 2>&1
-if errorlevel 1 goto :need_lmstudio
+if not errorlevel 1 set "LMS=lms"
+if not defined LMS if exist "%USERPROFILE%\.lmstudio\bin\lms.exe" set "LMS=%USERPROFILE%\.lmstudio\bin\lms.exe"
+
+if not defined LMS goto :need_lmstudio
+
+rem Older LM Studio installs may need one bootstrap to expose the CLI cleanly.
+"%LMS%" --help >nul 2>&1
+if errorlevel 1 (
+  "%LMS%" bootstrap >nul 2>&1
+)
 
 echo [1/4] LM Studio CLI found.
 echo.
 echo [2/4] Downloading recommended local model...
 echo       qwen/qwen3-8b @ Q4_K_M
-lms get qwen/qwen3-8b@q4_k_m --gguf
+"%LMS%" get qwen/qwen3-8b@q4_k_m --gguf
 if errorlevel 1 (
   echo.
   echo Automatic model download did not complete.
@@ -31,7 +41,7 @@ if errorlevel 1 (
 echo.
 echo [3/4] Locating and loading the model with an 8192-token context...
 set "MODELKEY="
-for /f "usebackq delims=" %%M in (`powershell -NoProfile -Command "$raw = (lms ls --json ^| Out-String); $j = $raw ^| ConvertFrom-Json; if ($j.models) { $items = $j.models } else { $items = $j }; $m = $items ^| Where-Object { $_.modelKey -match 'qwen.*3.*8b' } ^| Select-Object -First 1; if ($m) { Write-Output $m.modelKey }"`) do set "MODELKEY=%%M"
+for /f "usebackq delims=" %%M in (`powershell -NoProfile -Command "$exe = '%LMS%'; $raw = ^& $exe ls --json ^| Out-String; $j = $raw ^| ConvertFrom-Json; if ($j.models) { $items = $j.models } else { $items = $j }; $m = $items ^| Where-Object { $_.modelKey -match 'qwen.*3.*8b' -or $_.path -match 'qwen.*3.*8b' } ^| Select-Object -First 1; if ($m.modelKey) { Write-Output $m.modelKey } elseif ($m.path) { Write-Output $m.path }"`) do set "MODELKEY=%%M"
 if not defined MODELKEY (
   echo Could not identify the downloaded Qwen3 8B model key.
   echo Open LM Studio and load the model manually, then start the server.
@@ -39,8 +49,8 @@ if not defined MODELKEY (
   exit /b 1
 )
 echo Found model key: %MODELKEY%
-lms unload --all >nul 2>&1
-lms load "%MODELKEY%" --identifier investment-local --context-length 8192 --gpu 0.5
+"%LMS%" unload --all >nul 2>&1
+"%LMS%" load "%MODELKEY%" --identifier investment-local --context-length 8192 --gpu 0.5
 if errorlevel 1 (
   echo.
   echo Automatic load failed. In LM Studio, load the downloaded Qwen3 8B model manually.
@@ -51,7 +61,7 @@ if errorlevel 1 (
 
 echo.
 echo [4/4] Starting the local API server on port 1234...
-lms server start
+"%LMS%" server start
 if errorlevel 1 (
   echo.
   echo Start the server manually in LM Studio: Developer ^> Start server.
