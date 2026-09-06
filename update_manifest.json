@@ -1,11 +1,13 @@
 {
-  "version": "0.3.1",
+  "version": "0.4.0",
   "download_url": "https://github.com/trytobetheone/investment-copilot-updates/archive/refs/heads/main.zip",
   "sha256": "",
   "notes": [
-    "LOCAL/HYBRID에서 Qwen3가 MaxTurnsExceeded에 빠질 수 있는 문제를 수정했습니다.",
-    "로컬 에이전트는 이제 Agents SDK의 다중-turn 루프 대신 LM Studio JSON Schema one-shot 호출을 사용합니다.",
-    "Qwen3에는 /no_think와 구조화 JSON 출력을 강제해 16GB 노트북에서 더 빠르고 안정적으로 동작합니다.",
-    "CLOUD 모드는 기존 OpenAI Agents SDK 흐름을 그대로 유지합니다."
+    "ETF 중심 / ETF+개별주 혼합 / 개별주 적극 활용 모드를 추가했습니다.",
+    "LOCAL 모드에서 한국·미국 대형 개별주 후보와 가격기반 스크린을 함께 검토하며 개별주는 종목당 최대 10%로 제한합니다.",
+    "LOCAL 에이전트 설명문, 앱 UI, HTML 보고서를 한국어 중심으로 바꿨습니다.",
+    "추천안 그대로 실행 / 일부 수정 후 실행 / 미채택 여부를 분석별로 기록할 수 있습니다.",
+    "실제 실행 포트폴리오를 저장하면 해당 고객의 현재 보유자산으로 자동 반영되어 다음 분석에 사용됩니다.",
+    "목표수익률 미지정만으로 FAIL 처리되거나 높은 손실감내도를 반대로 해석하는 문제를 보강했습니다."
   ]
 }
