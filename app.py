@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
+import sys
+from pathlib import Path
+
 import pandas as pd
+import psutil
 import streamlit as st
 
-from investment_copilot.config import settings
+from investment_copilot.ai_backend import AIConfig, list_local_models, load_ai_config, needs_openai_api, save_ai_config
+from investment_copilot.config import BASE_DIR, settings
 from investment_copilot.db import Database
 from investment_copilot.orchestrator import run_investment_committee
 from investment_copilot.reports import build_html_report, selected_candidate, selected_quant
@@ -21,7 +28,11 @@ db = Database()
 
 def profile_to_df(profile: ClientProfile | None) -> pd.DataFrame:
     if not profile or not profile.holdings:
-        return pd.DataFrame([{"ticker": "", "name": "", "asset_class": "", "currency": "USD", "weight": 0.0}])
+        return pd.DataFrame(
+            [
+                {"ticker": "", "name": "", "asset_class": "", "currency": "USD", "weight": 0.0},
+            ]
+        )
     return pd.DataFrame([h.model_dump() for h in profile.holdings])
 
 
@@ -35,13 +46,15 @@ def df_to_holdings(df: pd.DataFrame) -> list[Holding]:
             weight = float(row.get("weight", 0) or 0)
         except Exception:
             weight = 0.0
-        out.append(Holding(
-            ticker=ticker,
-            name=str(row.get("name", "")),
-            asset_class=str(row.get("asset_class", "Other") or "Other"),
-            currency=str(row.get("currency", "USD") or "USD"),
-            weight=weight,
-        ))
+        out.append(
+            Holding(
+                ticker=ticker,
+                name=str(row.get("name", "")),
+                asset_class=str(row.get("asset_class", "Other") or "Other"),
+                currency=str(row.get("currency", "USD") or "USD"),
+                weight=weight,
+            )
+        )
     return out
 
 
@@ -81,15 +94,17 @@ def render_record(record):
         qmap = {q.candidate_id: q.metrics for q in record.quant_results}
         for c in record.candidates.candidates:
             m = qmap.get(c.candidate_id)
-            rows.append({
-                "후보": c.candidate_id,
-                "성격": c.label,
-                "과거수익률%": getattr(m, "annualized_return_pct", None),
-                "변동성%": getattr(m, "annualized_volatility_pct", None),
-                "MDD%": getattr(m, "max_drawdown_pct", None),
-                "Sharpe": getattr(m, "sharpe_ratio", None),
-                "Quant상태": getattr(m, "status", None),
-            })
+            rows.append(
+                {
+                    "후보": c.candidate_id,
+                    "성격": c.label,
+                    "과거수익률%": getattr(m, "annualized_return_pct", None),
+                    "변동성%": getattr(m, "annualized_volatility_pct", None),
+                    "MDD%": getattr(m, "max_drawdown_pct", None),
+                    "Sharpe": getattr(m, "sharpe_ratio", None),
+                    "Quant상태": getattr(m, "status", None),
+                }
+            )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     c1, c2 = st.columns(2)
@@ -162,7 +177,8 @@ st.caption("독립 리서치 → 후보생성 → 로컬 정량검증 → Bear/F
 st.info("고객 실명·주민번호·계좌번호는 입력하지 말고 Client Code를 쓰는 것을 권장합니다. 이 앱은 거래를 자동 실행하지 않습니다.")
 
 page = st.sidebar.radio("메뉴", ["고객 & 분석", "분석 기록", "설정", "업데이트"])
-st.sidebar.caption(f"Version: {current_version()}\n\nMain model: {settings.main_model}\n\nFast model: {settings.fast_model}")
+ai_cfg_sidebar = load_ai_config()
+st.sidebar.caption(f"Version: {current_version()}\n\nAI mode: {ai_cfg_sidebar.mode}\n\nMain model: {settings.main_model}\n\nFast model: {settings.fast_model}")
 
 if page == "업데이트":
     st.header("업데이트")
@@ -214,24 +230,101 @@ if page == "업데이트":
 
 elif page == "설정":
     st.header("설정")
+
+    st.subheader("AI 엔진")
+    ai_cfg = load_ai_config()
+    mode_labels = {
+        "LOCAL": "🖥️ LOCAL — 노트북에서만 추론 · OpenAI API 비용 0원",
+        "HYBRID": "🔀 HYBRID — 웹 리서치/Fact Check만 OpenAI · 나머지는 로컬",
+        "CLOUD": "☁️ CLOUD — 전체 OpenAI API",
+    }
+    mode_order = ["LOCAL", "HYBRID", "CLOUD"]
+    selected_label = st.radio(
+        "실행 모드",
+        [mode_labels[x] for x in mode_order],
+        index=mode_order.index(ai_cfg.mode) if ai_cfg.mode in mode_order else 0,
+    )
+    selected_mode = next(k for k, v in mode_labels.items() if v == selected_label)
+
+    local_base = st.text_input("LM Studio 주소", value=ai_cfg.local_base_url, help="기본값 http://127.0.0.1:1234/v1")
+    local_model_value = st.text_input(
+        "로컬 모델 ID",
+        value=ai_cfg.local_model,
+        placeholder="예: investment-local 또는 LM Studio에 로드된 모델 ID",
+    )
+
+    c_local1, c_local2 = st.columns(2)
+    with c_local1:
+        if st.button("🔌 로컬 AI 연결 확인", use_container_width=True):
+            try:
+                models = list_local_models(local_base)
+                st.session_state["detected_local_models"] = models
+                if models:
+                    st.success("LM Studio 연결 성공 · 로드된 모델: " + ", ".join(models))
+                else:
+                    st.warning("LM Studio 서버는 켜져 있지만 로드된 모델이 없습니다.")
+            except Exception as exc:
+                st.error(str(exc))
+    with c_local2:
+        if st.button("🧩 LOCAL AI 설치/준비 도우미", use_container_width=True):
+            helper = BASE_DIR / "LOCAL_AI_SETUP.bat"
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(str(helper))  # type: ignore[attr-defined]
+                    st.info("별도 설치 도우미 창을 열었습니다.")
+                else:
+                    st.warning("LOCAL_AI_SETUP.bat은 Windows 전용입니다.")
+            except Exception as exc:
+                st.error(f"설치 도우미를 열지 못했습니다: {exc}")
+
+    detected = st.session_state.get("detected_local_models") or []
+    if detected:
+        default_idx = detected.index(local_model_value) if local_model_value in detected else 0
+        picked = st.selectbox("감지된 로컬 모델에서 선택", detected, index=default_idx)
+        if st.button("선택한 모델 ID 사용"):
+            st.session_state["local_model_pick"] = picked
+            st.success(f"선택됨: {picked} · 아래 'AI 엔진 설정 저장'을 눌러주세요.")
+    if st.session_state.get("local_model_pick"):
+        local_model_value = st.session_state["local_model_pick"]
+        st.caption(f"저장 예정 로컬 모델: {local_model_value}")
+
+    vm = psutil.virtual_memory()
+    available_gb = vm.available / (1024**3)
+    st.caption(f"현재 사용 가능 메모리 약 {available_gb:.1f}GB / 전체 {vm.total/(1024**3):.1f}GB")
+    if selected_mode in {"LOCAL", "HYBRID"} and available_gb < 7:
+        st.warning("7~8B Q4 로컬 모델용 여유 메모리가 부족할 수 있습니다. 니케 등 게임/대형 앱을 종료한 뒤 실행하는 것을 권장합니다.")
+
+    if st.button("💾 AI 엔진 설정 저장", type="primary", use_container_width=True):
+        save_ai_config(AIConfig(mode=selected_mode, local_base_url=local_base, local_model=local_model_value))
+        st.success(f"AI 모드를 {selected_mode}로 저장했습니다.")
+
+    if selected_mode == "LOCAL":
+        st.info("LOCAL 모드는 OpenAI API key/크레딧을 사용하지 않습니다. 최신 웹 사실 검증 대신 Yahoo Finance 시장 스냅샷 + 로컬 상품 카탈로그 + 로컬 Quant를 사용합니다.")
+    elif selected_mode == "HYBRID":
+        st.info("HYBRID는 Macro/Product/Fact Check에만 OpenAI를 사용하고 Suitability/Bear/Compliance/CIO는 로컬 모델을 사용합니다.")
+
+    st.divider()
+    st.subheader("OpenAI API (HYBRID/CLOUD 전용)")
     configured = bool(get_openai_api_key())
     st.write("OpenAI API key:", "✅ 저장됨" if configured else "❌ 미설정")
     new_key = st.text_input("새 API key", type="password", placeholder="sk-...")
-    if st.button("Windows Credential Manager에 저장", type="primary"):
+    if st.button("Windows Credential Manager에 저장"):
         try:
             save_openai_api_key(new_key)
             st.success("저장했습니다. API key는 앱 DB가 아니라 OS 자격 증명 저장소를 사용합니다.")
         except Exception as exc:
             st.error(str(exc))
-    st.markdown("""
-**기본 안전장치**
-- 고객 프로필은 로컬 SQLite에 저장됩니다.
-- API key는 가능한 경우 OS keyring에 저장합니다.
-- 최종 CIO는 정량검증이 끝난 C1/C2/C3만 선택할 수 있습니다.
-- Suitability / Fact Check / Compliance 중 FAIL이 있으면 자동으로 Human Review로 바뀝니다.
-- 자동매매/주문 전송 기능은 포함하지 않았습니다.
-""")
-
+    st.markdown(
+        """
+        **기본 안전장치**
+        - 고객 프로필은 로컬 SQLite에 저장됩니다.
+        - LOCAL 모드의 LLM 추론은 LM Studio localhost로만 전송됩니다.
+        - API key는 가능한 경우 OS keyring에 저장합니다.
+        - 최종 CIO는 정량검증이 끝난 C1/C2/C3만 선택할 수 있습니다.
+        - Suitability / Fact Check / Compliance 중 FAIL이 있으면 자동으로 Human Review로 바뀝니다.
+        - 자동매매/주문 전송 기능은 포함하지 않았습니다.
+        """
+    )
 elif page == "분석 기록":
     st.header("분석 기록")
     clients = db.list_clients()
@@ -240,17 +333,19 @@ elif page == "분석 기록":
     if not rows:
         st.info("아직 저장된 분석이 없습니다.")
     else:
-        table = pd.DataFrame([
-            {
-                "id": r["id"],
-                "client_code": r["client_code"],
-                "created_at": r["created_at"],
-                "decision": r["record"]["final"]["decision"],
-                "selected": r["record"]["final"].get("selected_candidate_id"),
-                "confidence": r["record"]["final"]["confidence_pct"],
-            }
-            for r in rows
-        ])
+        table = pd.DataFrame(
+            [
+                {
+                    "id": r["id"],
+                    "client_code": r["client_code"],
+                    "created_at": r["created_at"],
+                    "decision": r["record"]["final"]["decision"],
+                    "selected": r["record"]["final"].get("selected_candidate_id"),
+                    "confidence": r["record"]["final"]["confidence_pct"],
+                }
+                for r in rows
+            ]
+        )
         st.dataframe(table, use_container_width=True, hide_index=True)
         ids = [r["id"] for r in rows]
         rid = st.selectbox("상세보기 ID", ids)
@@ -274,8 +369,7 @@ else:
     with c1:
         client_code = st.text_input("Client Code", value=e.client_code if e else "CLIENT_001")
         assets = st.number_input("투자가능자산", min_value=1.0, value=float(e.investable_assets) if e else 300_000_000.0, step=10_000_000.0)
-        currencies = ["KRW", "USD", "JPY", "EUR"]
-        base_currency = st.selectbox("기준통화", currencies, index=currencies.index(e.base_currency) if e and e.base_currency in currencies else 0)
+        base_currency = st.selectbox("기준통화", ["KRW", "USD", "JPY", "EUR"], index=["KRW", "USD", "JPY", "EUR"].index(e.base_currency) if e and e.base_currency in ["KRW", "USD", "JPY", "EUR"] else 0)
     with c2:
         horizon = st.number_input("투자기간(년)", min_value=1, max_value=60, value=e.horizon_years if e else 5)
         max_loss = st.slider("감내 가능한 최대손실(%)", 1, 80, int(e.max_tolerable_loss_pct) if e else 20)
@@ -323,10 +417,17 @@ else:
             db.upsert_client(profile)
             st.success("로컬 DB에 저장했습니다.")
     with b2:
-        can_run = bool(get_openai_api_key())
-        if not can_run:
-            st.warning("먼저 설정 메뉴에서 OpenAI API key를 저장하세요.")
-        run = st.button("🚀 투자위원회 실행", type="primary", use_container_width=True, disabled=not can_run)
+        active_ai = load_ai_config()
+        api_configured = bool(get_openai_api_key())
+        can_run = True
+        if needs_openai_api(active_ai.mode) and not api_configured:
+            can_run = False
+            st.warning("현재 HYBRID/CLOUD 모드는 OpenAI API key가 필요합니다. LOCAL 모드라면 API key 없이 실행할 수 있습니다.")
+        if active_ai.mode in {"LOCAL", "HYBRID"}:
+            vm_now = psutil.virtual_memory()
+            if vm_now.available / (1024**3) < 4:
+                st.warning("로컬 AI용 여유 메모리가 매우 적습니다. 게임이나 대형 앱을 종료하세요.")
+        run = st.button(f"🚀 투자위원회 실행 · {active_ai.mode}", type="primary", use_container_width=True, disabled=not can_run)
 
     if run:
         db.upsert_client(profile)
@@ -342,5 +443,15 @@ else:
             render_record(record)
         except Exception as exc:
             status.update(label="분석 실패", state="error", expanded=True)
-            st.exception(exc)
-            st.info("네트워크/API key/모델 접근권한/market-data ticker 형식을 확인하세요. 실패한 실행은 분석 기록에 저장하지 않습니다.")
+            text = str(exc)
+            lower = text.lower()
+            if "credit_balance_exhausted" in lower or "no credits remaining" in lower or "insufficient_quota" in lower:
+                st.error("OpenAI API 크레딧이 없습니다. 설정에서 LOCAL 모드로 바꾸면 OpenAI 크레딧 없이 실행할 수 있습니다.")
+            elif "lm studio" in lower or "로컬 서버" in lower or "로드된 모델" in lower:
+                st.error(text)
+                st.info("설정 → LOCAL AI 설치/준비 도우미를 실행하고, LM Studio에서 모델을 로드한 뒤 서버를 켜세요.")
+            else:
+                st.error(text)
+                with st.expander("기술 상세 오류"):
+                    st.exception(exc)
+            st.info("실패한 실행은 분석 기록에 저장하지 않습니다.")
