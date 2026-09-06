@@ -9,6 +9,9 @@ if not exist ".venv\Scripts\python.exe" (
   if errorlevel 1 exit /b 1
 )
 
+rem Ensure the project root is importable by helper scripts launched from scripts\.
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
+
 echo.
 echo Checking agent output schemas...
 ".venv\Scripts\python.exe" scripts\schema_preflight.py >nul 2>&1
