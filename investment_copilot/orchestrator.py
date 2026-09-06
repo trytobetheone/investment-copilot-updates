@@ -9,7 +9,7 @@ from typing import Any, Callable
 from agents import Runner
 
 from .agents import bear_agent, cio_agent, compliance_agent, factcheck_agent, macro_agent, product_agent, suitability_agent
-from .ai_backend import build_local_model, load_ai_config, needs_openai_api
+from .ai_backend import load_ai_config, needs_openai_api, resolve_local_model, run_local_structured
 from .config import settings
 from .local_research import build_market_snapshot, build_product_catalog
 from .quant import analyze_candidates, construct_candidates
@@ -30,6 +30,19 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
 
 
+async def _run_local_agent(ai_cfg: Any, agent: Any, prompt: str):
+    instructions = agent.instructions if isinstance(agent.instructions, str) else str(agent.instructions)
+    output_type = agent.output_type
+    if output_type is None:
+        raise RuntimeError(f"LOCAL agent {agent.name} has no structured output type.")
+    return await run_local_structured(
+        ai_cfg,
+        instructions=instructions,
+        prompt=prompt,
+        output_type=output_type,
+    )
+
+
 def _configure_openai_if_needed(mode: str) -> None:
     if not needs_openai_api(mode):
         return
@@ -41,7 +54,7 @@ def _configure_openai_if_needed(mode: str) -> None:
     os.environ["OPENAI_API_KEY"] = api_key
 
 
-async def _run_local_round1(profile: ClientProfile, profile_json: str, local_model: Any, cb: ProgressCallback):
+async def _run_local_round1(profile: ClientProfile, profile_json: str, ai_cfg: Any, cb: ProgressCallback):
     _emit(cb, "local-data", "Yahoo Finance 벤치마크로 로컬 시장 스냅샷을 만드는 중")
     snapshot = await asyncio.to_thread(build_market_snapshot, 2)
     catalog = build_product_catalog(profile)
@@ -57,8 +70,7 @@ LOCAL MARKET SNAPSHOT
 
 Important: You have no web access. Use only this snapshot for current market observations.
 """
-    macro_result = await Runner.run(macro_agent(local_model, web_enabled=False), macro_prompt)
-    macro = macro_result.final_output
+    macro = await _run_local_agent(ai_cfg, macro_agent(web_enabled=False), macro_prompt)
 
     _emit(cb, "round1-local", "LOCAL Product Agent 실행 중 (고정 검증 카탈로그에서만 선택)")
     product_prompt = f"""
@@ -70,12 +82,10 @@ LOCAL PRODUCT CATALOG
 
 Select 4-8 products ONLY from the catalog. Do not invent products, fees, tax facts, or URLs.
 """
-    product_result = await Runner.run(product_agent(local_model, web_enabled=False), product_prompt)
-    product = product_result.final_output
+    product = await _run_local_agent(ai_cfg, product_agent(web_enabled=False), product_prompt)
 
     _emit(cb, "round1-local", "LOCAL Suitability Agent 실행 중")
-    suitability_result = await Runner.run(suitability_agent(local_model), f"Review this client profile exactly as supplied:\n{profile_json}")
-    suitability = suitability_result.final_output
+    suitability = await _run_local_agent(ai_cfg, suitability_agent(), f"Review this client profile exactly as supplied:\n{profile_json}")
     return macro, product, suitability, snapshot, catalog
 
 
@@ -88,13 +98,13 @@ async def _run_cloud_round1(profile_json: str, cb: ProgressCallback):
     return macro_result.final_output, product_result.final_output, suitability_result.final_output
 
 
-async def _run_hybrid_round1(profile_json: str, local_model: Any, cb: ProgressCallback):
+async def _run_hybrid_round1(profile_json: str, ai_cfg: Any, cb: ProgressCallback):
     _emit(cb, "round1-hybrid", "Macro/Product는 웹 리서치, Suitability는 LOCAL 모델로 실행 중")
     macro_task = Runner.run(macro_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
     product_task = Runner.run(product_agent(), f"Today's UTC date is {datetime.now(timezone.utc).date()}. Client context:\n{profile_json}")
     macro_result, product_result = await asyncio.gather(macro_task, product_task)
-    suitability_result = await Runner.run(suitability_agent(local_model), f"Review this client profile exactly as supplied:\n{profile_json}")
-    return macro_result.final_output, product_result.final_output, suitability_result.final_output
+    suitability = await _run_local_agent(ai_cfg, suitability_agent(), f"Review this client profile exactly as supplied:\n{profile_json}")
+    return macro_result.final_output, product_result.final_output, suitability
 
 
 async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisRecord:
@@ -102,19 +112,19 @@ async def _run(profile: ClientProfile, cb: ProgressCallback = None) -> AnalysisR
     mode = ai_cfg.mode.upper()
     _configure_openai_if_needed(mode)
 
-    local_model = None
     if mode in {"LOCAL", "HYBRID"}:
         _emit(cb, "local-ai", "LM Studio 로컬 모델 연결 확인 중")
-        local_model = build_local_model(ai_cfg)
+        local_model_id = resolve_local_model(ai_cfg)
+        _emit(cb, "local-ai", f"로컬 모델 연결됨: {local_model_id}")
 
     profile_json = profile.model_dump_json(indent=2)
     local_snapshot: dict[str, Any] | None = None
     local_catalog: list[dict[str, Any]] | None = None
 
     if mode == "LOCAL":
-        macro, product, suitability, local_snapshot, local_catalog = await _run_local_round1(profile, profile_json, local_model, cb)
+        macro, product, suitability, local_snapshot, local_catalog = await _run_local_round1(profile, profile_json, ai_cfg, cb)
     elif mode == "HYBRID":
-        macro, product, suitability = await _run_hybrid_round1(profile_json, local_model, cb)
+        macro, product, suitability = await _run_hybrid_round1(profile_json, ai_cfg, cb)
     else:
         macro, product, suitability = await _run_cloud_round1(profile_json, cb)
 
@@ -164,16 +174,17 @@ LOCAL PRODUCT CATALOG
 
     if mode == "LOCAL":
         _emit(cb, "review-local", "LOCAL Bear Agent 실행 중")
-        bear_result = await Runner.run(bear_agent(local_model, local_mode=True), review_packet)
+        bear = await _run_local_agent(ai_cfg, bear_agent(local_mode=True), review_packet)
         _emit(cb, "review-local", "LOCAL Fact Checker 실행 중 (웹 검증 아님)")
-        fact_result = await Runner.run(factcheck_agent(local_model, web_enabled=False), review_packet)
+        factcheck = await _run_local_agent(ai_cfg, factcheck_agent(web_enabled=False), review_packet)
         _emit(cb, "review-local", "LOCAL Compliance Agent 실행 중")
-        compliance_result = await Runner.run(compliance_agent(local_model, local_mode=True), review_packet)
+        compliance = await _run_local_agent(ai_cfg, compliance_agent(local_mode=True), review_packet)
     elif mode == "HYBRID":
         _emit(cb, "review-hybrid", "Bear/Compliance는 LOCAL, Fact Check만 웹 리서치로 실행 중")
-        bear_result = await Runner.run(bear_agent(local_model, local_mode=True), review_packet)
+        bear = await _run_local_agent(ai_cfg, bear_agent(local_mode=True), review_packet)
         fact_result = await Runner.run(factcheck_agent(), review_packet)
-        compliance_result = await Runner.run(compliance_agent(local_model, local_mode=True), review_packet)
+        factcheck = fact_result.final_output
+        compliance = await _run_local_agent(ai_cfg, compliance_agent(local_mode=True), review_packet)
     else:
         _emit(cb, "review-cloud", "Bear·Fact Check·Compliance 세 팀을 OpenAI로 교차검증 중")
         bear_task = Runner.run(bear_agent(), review_packet)
@@ -181,7 +192,8 @@ LOCAL PRODUCT CATALOG
         compliance_task = Runner.run(compliance_agent(), review_packet)
         bear_result, fact_result, compliance_result = await asyncio.gather(bear_task, fact_task, compliance_task)
 
-    bear, factcheck, compliance = bear_result.final_output, fact_result.final_output, compliance_result.final_output
+    if mode == "CLOUD":
+        bear, factcheck, compliance = bear_result.final_output, fact_result.final_output, compliance_result.final_output
 
     _emit(cb, "cio", f"CIO 최종판정 실행 중 ({'LOCAL' if mode in {'LOCAL','HYBRID'} else 'OpenAI'})")
     final_packet = review_packet + f"""
@@ -198,10 +210,10 @@ COMPLIANCE REVIEW
 IMPORTANT: select only C1/C2/C3 or HUMAN_REVIEW_REQUIRED. Do not change any allocation.
 """
     if mode in {"LOCAL", "HYBRID"}:
-        final_result = await Runner.run(cio_agent(local_model, local_mode=True), final_packet)
+        final = await _run_local_agent(ai_cfg, cio_agent(local_mode=True), final_packet)
     else:
         final_result = await Runner.run(cio_agent(), final_packet)
-    final = final_result.final_output
+        final = final_result.final_output
 
     valid_ids = {c.candidate_id for c in candidates.candidates}
     if final.decision == "SELECT" and final.selected_candidate_id not in valid_ids:
