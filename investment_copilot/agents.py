@@ -24,7 +24,8 @@ Rules:
 - Prefer diversified, liquid, transparent instruments unless client constraints justify otherwise.
 - Do not claim certainty about future returns.
 - The human consultant owns the final client recommendation and execution decision.
-- Write substantive content in Korean unless a ticker/product name is naturally English.
+- 모든 설명형 자연어 문자열은 반드시 한국어로 작성한다. 티커, 고유 상품명, enum/code 값만 영문을 허용한다.
+- summary, rationale, why_fit, risks, notes, issues, scenarios, monitoring_triggers 등 설명 문장은 한국어여야 한다.
 """
 
 LOCAL_LIMIT = """
@@ -70,6 +71,12 @@ def product_agent(model: Any | None = None, web_enabled: bool = True) -> Agent:
     instructions = COMMON + ("" if web_enabled else LOCAL_LIMIT) + """
 Independently build a compact product universe for the client's constraints.
 Return 4-8 liquid/transparent instruments spanning multiple asset classes; do not assign portfolio weights.
+Read client product_style exactly:
+- ETF_ONLY: use ETF/cash only.
+- MIXED: unless individual stocks are explicitly prohibited, include at least 2 [STOCK] candidates and at least 2 diversified [ETF]/cash candidates in the product universe.
+- STOCK_ACTIVE: unless individual stocks are explicitly prohibited, include 3-5 [STOCK] candidates plus at least 1 diversified [ETF]/cash anchor.
+These are candidates, not automatic weights; local Python will cap each individual stock at 10%.
+For every individual stock, role MUST begin with [STOCK]. For every ETF, role MUST begin with [ETF].
 Use only these asset_class labels: US_EQUITY, KR_EQUITY, DM_EQUITY, EM_EQUITY, GOV_BOND, IG_CREDIT,
 HY_CREDIT, GOLD, COMMODITY, REIT, CASH, OTHER. Respect explicit restrictions such as PTP, leverage,
 derivatives, geography, or currency constraints.
@@ -83,7 +90,8 @@ currency, and known tax/operational caveats. Prefer issuer/exchange/regulator ev
     else:
         instructions += """
 You MUST select only tickers explicitly present in the supplied LOCAL PRODUCT CATALOG.
-Do not infer fees or tax treatment. Products marked as user-supplied holdings require human identity/structure verification.
+Use the supplied LOCAL STOCK SCREEN when choosing among individual-stock candidates, but remember it is price-only and NOT fundamental research.
+Do not infer fees, tax treatment, earnings quality, valuation, or future catalysts that are not supplied. Products marked as user-supplied holdings require human identity/structure verification.
 Use catalog role/name/currency/asset_class exactly enough to avoid changing the product identity.
 """
     return Agent(
@@ -104,7 +112,8 @@ def suitability_agent(model: Any | None = None) -> Agent:
 Assess only the supplied client profile. Identify missing decision-critical information, binding constraints, liquidity needs,
 loss tolerance, horizon, experience, restrictions, and any mismatch between target return and risk tolerance.
 Do not research markets and do not recommend products. Be conservative when information is missing.
-The max_risk_budget_pct field should reflect the client's stated maximum tolerable loss, not your own forecast.
+The max_risk_budget_pct field should reflect the client's stated maximum tolerable loss, not your own forecast. A larger maximum-loss percentage means MORE loss tolerance, not less.
+Missing target_return_pct by itself is NOT a FAIL; it is at most REVIEW. Use FAIL only for a hard contradiction or explicit constraint that makes a recommendation unsuitable.
 """,
         output_type=SuitabilityReport,
     )
@@ -139,7 +148,8 @@ Do not judge whether the portfolio is attractive; judge factual support only.
         instructions += """
 Perform a LOCAL consistency check only. Verify that candidate tickers/products exist in the supplied LOCAL PRODUCT CATALOG or are explicitly
 identified as user-supplied holdings, and that claimed historical metrics come from the LOCAL QUANT RESULTS. Do not claim external verification.
-For LOCAL-only check items, set source_name to LOCAL PRODUCT CATALOG or LOCAL QUANT RESULTS and set url to an empty string.
+For LOCAL-only check items, set source_name to LOCAL PRODUCT CATALOG, LOCAL STOCK SCREEN, or LOCAL QUANT RESULTS and set url to an empty string.
+Interpret max_tolerable_loss_pct correctly: a higher number means the client tolerates a larger loss. Do not claim a 10% drawdown conflicts with an 80% loss tolerance.
 For claims requiring issuer/regulatory/web evidence, use UNVERIFIED or PARTIAL and explain that human verification is required.
 The overall status should normally be REVIEW rather than FAIL solely because LOCAL mode lacks web verification; use FAIL only for an actual contradiction,
 unknown candidate ticker, or materially inconsistent data.
@@ -164,6 +174,7 @@ Perform a process-level suitability/compliance sanity check on the proposed cand
 This is not legal advice and you must not claim regulatory approval. Flag missing KYC/suitability facts, prohibited/restricted assets,
 liquidity mismatch, target-return/loss-tolerance conflicts, unverifiable product facts, or any recommendation that requires human review.
 The disclaimer must clearly say this is decision support and the human financial professional must apply applicable firm policy and law before client use.
+Use FAIL only for an actual hard prohibition, an explicit suitability contradiction, or a material data inconsistency. Missing optional information such as target_return_pct, or an unusually high stated loss tolerance that merely needs confirmation, should normally be REVIEW rather than FAIL.
 """,
         output_type=ComplianceReview,
     )
