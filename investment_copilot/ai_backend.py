@@ -5,9 +5,10 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, TypeVar
 
 from openai import AsyncOpenAI
+from pydantic import BaseModel, ValidationError
 from agents import OpenAIChatCompletionsModel
 
 from .config import DATA_DIR
@@ -110,3 +111,103 @@ def build_local_model(config: AIConfig) -> OpenAIChatCompletionsModel:
 
 def needs_openai_api(mode: str) -> bool:
     return str(mode).upper() in {"HYBRID", "CLOUD"}
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def _strip_schema_defaults(node: Any) -> Any:
+    """Remove JSON-Schema defaults that some local grammar engines reject."""
+    if isinstance(node, dict):
+        return {k: _strip_schema_defaults(v) for k, v in node.items() if k != "default"}
+    if isinstance(node, list):
+        return [_strip_schema_defaults(v) for v in node]
+    return node
+
+
+def _extract_json_object(text: str) -> str:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        lines = value.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        value = "\n".join(lines).strip()
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        value = value[start : end + 1]
+    return value
+
+
+async def run_local_structured(
+    config: AIConfig,
+    *,
+    instructions: str,
+    prompt: str,
+    output_type: type[T],
+    max_tokens: int = 3000,
+) -> T:
+    """One-shot structured call to LM Studio.
+
+    Deliberately bypasses Agents SDK's multi-turn tool loop for local models.
+    Qwen-family local models can otherwise keep trying to emit the structured
+    output as a tool call and hit MaxTurnsExceeded.
+    """
+    model_id = resolve_local_model(config)
+    client = AsyncOpenAI(
+        base_url=_normalize_base_url(config.local_base_url),
+        api_key="lm-studio",
+        timeout=180.0,
+        max_retries=0,
+    )
+    schema = _strip_schema_defaults(output_type.model_json_schema())
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": output_type.__name__,
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+    base_user = (
+        "/no_think\n"
+        "Return exactly one JSON object matching the required schema. "
+        "Do not call tools, do not wrap it in markdown, and do not add commentary.\n\n"
+        + prompt
+    )
+    last_error: Exception | None = None
+    retry_note = ""
+
+    for attempt in range(2):
+        try:
+            response = await client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": base_user + retry_note},
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+            content = response.choices[0].message.content or ""
+            candidate = _extract_json_object(content)
+            return output_type.model_validate_json(candidate)
+        except (ValidationError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            last_error = exc
+            retry_note = (
+                "\n\nYour previous response failed schema validation. "
+                "Retry once. Output ONLY the valid JSON object; keep arrays concise."
+            )
+        except Exception as exc:
+            last_error = exc
+            break
+
+    raise RuntimeError(
+        f"LOCAL AI가 {output_type.__name__} 형식의 결과를 만들지 못했습니다. "
+        "LM Studio에서 Qwen3 8B Q4_K_M이 로드되어 있는지 확인한 뒤 다시 실행하세요. "
+        f"기술 상세: {last_error}"
+    ) from last_error
