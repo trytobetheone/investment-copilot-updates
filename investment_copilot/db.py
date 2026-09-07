@@ -205,4 +205,4 @@ class Database:
                 f"SELECT analysis_id, status FROM executions WHERE analysis_id IN ({marks})",
                 analysis_ids,
             ).fetchall()
-        return {int(r["analysis_id"]): str(r["status"]) for r in rows]
+        return {int(r["analysis_id"]): str(r["status"]) for r in rows}
